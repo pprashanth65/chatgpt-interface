@@ -54,13 +54,26 @@ function App() {
     files.forEach(file => {
       formData.append('files', file);
     });
-    formData.append('history', JSON.stringify(messages));
+    
+    // Create a simplified history for Gemini API
+    // Gemini expects a specific format for chat history
+    const simplifiedHistory = messages.map(msg => ({
+      role: msg.role,
+      content: msg.content
+    }));
+    
+    formData.append('history', JSON.stringify(simplifiedHistory));
 
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
         body: formData
       });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.details || 'Failed to get response');
+      }
       
       const data = await response.json();
       
@@ -78,7 +91,7 @@ function App() {
         ...currentMessages,
         {
           role: 'assistant',
-          content: 'Sorry, I encountered an error processing your request.',
+          content: `Sorry, I encountered an error: ${error.message}`,
           timestamp: new Date().toISOString()
         }
       ]);
@@ -98,7 +111,7 @@ function App() {
   return (
     <div className="app-container">
       <header className="app-header">
-        <h1>My AI Assistant</h1>
+        <h1>Gemini AI Assistant</h1>
       </header>
       
       <div className="messages-container">

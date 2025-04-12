@@ -1,11 +1,11 @@
 // server.js
 const express = require('express');
 const multer = require('multer');
-const OpenAI = require('openai');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // Load environment variables
 dotenv.config();
@@ -16,10 +16,8 @@ const port = process.env.PORT || 3001;
 // Enable CORS
 app.use(cors());
 
-// Configure OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// Configure Google Generative AI
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
@@ -43,6 +41,17 @@ const upload = multer({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Function to convert file to base64
+function fileToGenerativePart(file, mimeType) {
+  const fileData = fs.readFileSync(file.path);
+  return {
+    inlineData: {
+      data: fileData.toString("base64"),
+      mimeType
+    }
+  };
+}
+
 // Extract text from different file types
 async function extractTextFromFile(file) {
   const filePath = file.path;
@@ -64,11 +73,6 @@ async function extractTextFromFile(file) {
     }
     else if (fileType.includes('text')) {
       return fs.readFileSync(filePath, 'utf8');
-    }
-    else if (fileType.includes('image')) {
-      // For images, we'll encode them to base64 and use OpenAI's vision capabilities
-      const base64Image = fs.readFileSync(filePath, { encoding: 'base64' });
-      return { type: 'image', data: base64Image };
     }
     return null;
   } catch (error) {
@@ -92,125 +96,65 @@ app.post('/api/chat', upload.array('files'), async (req, res) => {
       console.error('Error parsing history:', e);
     }
     
-    // Process files
-    const fileContents = await Promise.all(
-      files.map(async (file) => {
-        return await extractTextFromFile(file);
-      })
-    );
+    // Initialize the model
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-1.5-flash" 
+    });
     
-    // Build message history for OpenAI API
-    const messages = history.map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }));
+    // Start a chat session
+    const chat = model.startChat({
+      history: history.map(msg => ({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.content }]
+      })),
+      generationConfig: {
+        maxOutputTokens: 1000,
+      },
+    });
     
-    // Add the new user message
-    let userMessageContent = [];
+    // Build message content for Gemini API
+    const messageParts = [];
     
-    // Add text content if present
+    // Add text message
     if (message) {
-      userMessageContent.push({
-        type: 'text',
-        text: message
-      });
+      messageParts.push({ text: message });
     }
     
-    // Add file contents
-    for (let i = 0; i < fileContents.length; i++) {
-      const content = fileContents[i];
-      if (content) {
-        if (content.type === 'image') {
-          userMessageContent.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${files[i].mimetype};base64,${content.data}`
-            }
-          });
-        } else {
-          // For text-based files, append their content to the message
-          userMessageContent.push({
-            type: 'text',
-            text: `Content from file "${files[i].originalname}":\n${content}`
+    // Process images and other files
+    for (const file of files) {
+      if (file.mimetype.includes('image')) {
+        // Process image files directly
+        messageParts.push(fileToGenerativePart(file, file.mimetype));
+      } else {
+        // For non-image files, extract text and add as text content
+        const textContent = await extractTextFromFile(file);
+        if (textContent) {
+          messageParts.push({ 
+            text: `Content from file "${file.originalname}":\n${textContent}`
           });
         }
       }
     }
     
-    // If using older OpenAI API versions, we need to format differently
-    let userMessage;
+    // Send the message to Gemini
+    const result = await chat.sendMessage(messageParts);
+    const response = await result.response;
     
-    // Check if the API supports the content array format
-    if (userMessageContent.length > 0) {
-      try {
-        userMessage = {
-          role: 'user',
-          content: userMessageContent
-        };
-        
-        messages.push(userMessage);
-        
-        // Make API call to OpenAI with content array
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4-vision-preview", // Use vision model to handle images
-          messages: messages,
-          max_tokens: 1000
-        });
-        
-        // Return the response
-        res.json({
-          message: completion.choices[0].message.content
-        });
-      } catch (error) {
-        // If content array format fails, try the fallback format
-        console.error('Error with content array format:', error);
-        
-        // Build a simple string message as fallback
-        let fallbackContent = message || '';
-        
-        for (let i = 0; i < fileContents.length; i++) {
-          const content = fileContents[i];
-          if (content && content.type !== 'image') {
-            fallbackContent += `\n\nContent from file "${files[i].originalname}":\n${content}`;
-          }
-        }
-        
-        userMessage = {
-          role: 'user',
-          content: fallbackContent
-        };
-        
-        // Replace the last message if it existed
-        if (messages.length > 0 && messages[messages.length - 1].role === 'user') {
-          messages[messages.length - 1] = userMessage;
-        } else {
-          messages.push(userMessage);
-        }
-        
-        // Try again with simpler format
-        const completion = await openai.chat.completions.create({
-          model: "gpt-4", // Fallback to non-vision model
-          messages: messages,
-          max_tokens: 1000
-        });
-        
-        res.json({
-          message: completion.choices[0].message.content
-        });
-      }
-    } else {
-      // No content to send
-      res.status(400).json({ error: 'No message or file content provided' });
-    }
+    // Return the response
+    res.json({
+      message: response.text()
+    });
     
     // Clean up uploaded files
     for (const file of files) {
-      fs.unlinkSync(file.path);
+      if (fs.existsSync(file.path)) {
+        fs.unlinkSync(file.path);
+      }
     }
     
   } catch (error) {
     console.error('Error processing request:', error);
-    res.status(500).json({ error: 'An error occurred while processing your request' });
+    res.status(500).json({ error: 'An error occurred while processing your request', details: error.message });
   }
 });
 
